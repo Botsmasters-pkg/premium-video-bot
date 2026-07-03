@@ -4,11 +4,14 @@ from config import ADMIN_IDS, OWNER_ID
 from utils.database import Database
 from services.user_service import UserService
 from services.video_service import VideoService
+from services.payment_service import PaymentService
 from keyboards.admin_keyboards import get_admin_menu
-from utils.logger import bot_logger
+from utils.logger import bot_logger, error_logger
+from models.payment import PaymentStatus, PaymentMethod
 import csv
 from datetime import datetime
 import os
+import uuid
 
 
 class AdminHandlers:
@@ -19,7 +22,9 @@ class AdminHandlers:
         self.db = db
         self.user_service = UserService(db)
         self.video_service = VideoService(db)
+        self.payment_service = PaymentService(db)
         self.admin_states = {}  # Track admin states for multi-step operations
+        self.pending_videos = {}  # Track videos being uploaded
         self.register_handlers()
     
     def register_handlers(self) -> None:
@@ -27,6 +32,8 @@ class AdminHandlers:
         self.bot.message_handler(commands=['admin'])(self.handle_admin_panel)
         self.bot.message_handler(regexp=r'⬅ User Menu')(self.handle_user_menu)
         self.bot.message_handler(regexp=r'➕ Upload Video')(self.handle_upload_video)
+        self.bot.message_handler(content_types=['video'])(self.handle_video_file)
+        self.bot.message_handler(commands=['done'])(self.handle_upload_done)
         self.bot.message_handler(regexp=r'🎞 Video Stats')(self.handle_video_stats)
         self.bot.message_handler(regexp=r'🗑 Delete Video')(self.handle_delete_video)
         self.bot.message_handler(regexp=r'📊 Statistics')(self.handle_statistics)
@@ -40,6 +47,9 @@ class AdminHandlers:
         self.bot.message_handler(regexp=r'📁 Users CSV')(self.handle_users_csv)
         self.bot.message_handler(regexp=r'📁 Referral CSV')(self.handle_referral_csv)
         self.bot.message_handler(regexp=r'💾 Backup Database')(self.handle_backup)
+        self.bot.message_handler(regexp=r'💳 Payments')(self.handle_payments)
+        self.bot.message_handler(regexp=r'🔗 Force Join')(self.handle_force_join)
+        self.bot.message_handler(func=lambda m: self.is_admin(m.from_user.id))(self.handle_admin_text)
     
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -73,15 +83,126 @@ class AdminHandlers:
             )
     
     def handle_upload_video(self, message: Message) -> None:
-        """Handle video upload"""
+        """Handle video upload initiation"""
         if not self.is_admin(message.from_user.id):
             return
         
+        self.admin_states[message.from_user.id] = 'waiting_for_video'
+        self.pending_videos[message.from_user.id] = []
+        
         msg = self.bot.send_message(
             message.chat.id,
-            "📹 Send the video file(s). You can send multiple videos in sequence. Send /done when finished."
+            "📹 **Upload Video**\n\n"
+            "Send video file(s). You can send multiple videos in sequence.\n\n"
+            "After each video, you can add a caption.\n\n"
+            "Send /done when finished uploading all videos.",
+            parse_mode='Markdown'
         )
-        self.admin_states[message.from_user.id] = 'waiting_for_video'
+        bot_logger.info(f"Admin {message.from_user.id} started video upload")
+    
+    def handle_video_file(self, message: Message) -> None:
+        """Handle video file upload"""
+        try:
+            if not self.is_admin(message.from_user.id):
+                return
+            
+            if message.from_user.id not in self.admin_states or \
+               self.admin_states[message.from_user.id] != 'waiting_for_video':
+                self.bot.send_message(
+                    message.chat.id,
+                    "❌ Use '📹 Upload Video' button first."
+                )
+                return
+            
+            # Get video information
+            video = message.video
+            if not video:
+                self.bot.send_message(message.chat.id, "❌ Invalid video file.")
+                return
+            
+            # Check for duplicate
+            if self.video_service.get_video_by_unique_id(video.file_unique_id):
+                self.bot.send_message(
+                    message.chat.id,
+                    "⚠️ This video already exists. Skipping duplicate."
+                )
+                return
+            
+            # Store video temporarily
+            video_data = {
+                'file_id': video.file_id,
+                'file_unique_id': video.file_unique_id,
+                'caption': message.caption or '',
+                'duration': video.duration,
+                'uploaded_by': message.from_user.id
+            }
+            
+            if message.from_user.id not in self.pending_videos:
+                self.pending_videos[message.from_user.id] = []
+            
+            self.pending_videos[message.from_user.id].append(video_data)
+            
+            self.bot.send_message(
+                message.chat.id,
+                f"✅ Video {len(self.pending_videos[message.from_user.id])} received.\n\n"
+                f"📌 Duration: {video.duration}s\n"
+                f"📝 Caption: {video_data['caption'] or '(None)'}\n\n"
+                f"Send next video or /done to finish."
+            )
+            
+            bot_logger.info(f"Admin {message.from_user.id} uploaded video {video.file_unique_id}")
+        
+        except Exception as e:
+            error_logger.error(f"Error in handle_video_file: {e}")
+            self.bot.send_message(message.chat.id, f"❌ Error: {str(e)}")
+    
+    def handle_upload_done(self, message: Message) -> None:
+        """Handle upload completion"""
+        try:
+            if not self.is_admin(message.from_user.id):
+                return
+            
+            if message.from_user.id not in self.pending_videos:
+                self.bot.send_message(message.chat.id, "❌ No videos to upload.")
+                return
+            
+            videos = self.pending_videos[message.from_user.id]
+            if not videos:
+                self.bot.send_message(message.chat.id, "❌ No videos uploaded.")
+                return
+            
+            # Save all videos to database
+            saved_count = 0
+            for video_data in videos:
+                try:
+                    success = self.video_service.add_video(
+                        video_data['file_id'],
+                        video_data['file_unique_id'],
+                        video_data['caption'],
+                        message.from_user.id
+                    )
+                    if success:
+                        saved_count += 1
+                except Exception as e:
+                    error_logger.error(f"Failed to save video: {e}")
+            
+            # Clear pending videos
+            del self.pending_videos[message.from_user.id]
+            self.admin_states[message.from_user.id] = None
+            
+            self.bot.send_message(
+                message.chat.id,
+                f"✅ **Upload Complete**\n\n"
+                f"📊 Videos saved: {saved_count}/{len(videos)}\n\n"
+                f"Total videos in database: {len(self.video_service.get_videos())}",
+                parse_mode='Markdown'
+            )
+            
+            bot_logger.info(f"Admin {message.from_user.id} completed upload: {saved_count} videos")
+        
+        except Exception as e:
+            error_logger.error(f"Error in handle_upload_done: {e}")
+            self.bot.send_message(message.chat.id, f"❌ Error: {str(e)}")
     
     def handle_video_stats(self, message: Message) -> None:
         """Handle video statistics"""
@@ -92,17 +213,17 @@ class AdminHandlers:
             stats = self.video_service.get_video_stats()
             videos = self.video_service.get_videos()
             
-            stats_text = f"""
-🎞 **Video Statistics**
+            stats_text = f"""🎞 **Video Statistics**
 
 📊 Total Videos: `{stats.get('total_videos', 0)}`
 📅 Last Uploaded: `{stats.get('last_uploaded', 'N/A')}`
 
 📋 Recent Videos:
-            """
+"""
             
-            for i, video in enumerate(videos[-5:], 1):
-                stats_text += f"\n{i}. {video.caption[:30]}... (ID: {video.file_unique_id[:10]}...)"
+            for i, video in enumerate(videos[-10:], 1):
+                caption = video.caption[:30] if video.caption else "(No caption)"
+                stats_text += f"\n{i}. {caption}... (ID: {video.file_unique_id[:10]}...)"
             
             self.bot.send_message(
                 message.chat.id,
@@ -118,11 +239,25 @@ class AdminHandlers:
         if not self.is_admin(message.from_user.id):
             return
         
-        msg = self.bot.send_message(
-            message.chat.id,
-            "🗑 Enter the video index to delete (0-based):"
-        )
-        self.admin_states[message.from_user.id] = 'waiting_for_delete_index'
+        try:
+            videos = self.video_service.get_videos()
+            if not videos:
+                self.bot.send_message(message.chat.id, "❌ No videos to delete.")
+                return
+            
+            text = "🎬 **Videos List**\n\n"
+            for i, video in enumerate(videos):
+                caption = video.caption[:30] if video.caption else "(No caption)"
+                text += f"{i}. {caption}...\n"
+            
+            text += "\n\n📝 Reply with video index to delete (0-based)"
+            
+            self.bot.send_message(message.chat.id, text, parse_mode='Markdown')
+            self.admin_states[message.from_user.id] = 'waiting_for_delete_index'
+        
+        except Exception as e:
+            bot_logger.error(f"Error in handle_delete_video: {e}")
+            self.bot.send_message(message.chat.id, "❌ An error occurred.")
     
     def handle_statistics(self, message: Message) -> None:
         """Handle general statistics"""
@@ -134,17 +269,34 @@ class AdminHandlers:
             active_users = self.user_service.get_active_users()
             total_points = sum(u.points for u in users)
             total_referrals = sum(u.referrals for u in users)
+            videos = self.video_service.get_videos()
             
-            stats_text = f"""
-📊 **Global Statistics**
+            # Payment statistics
+            all_payments = self.payment_service.get_all_payments()
+            approved_payments = [p for p in all_payments if p.status == PaymentStatus.APPROVED.value]
+            pending_payments = [p for p in all_payments if p.status == PaymentStatus.PENDING.value]
+            
+            total_revenue = sum(p.amount for p in approved_payments)
+            
+            stats_text = f"""📊 **Global Statistics**
 
-👥 Total Users: `{len(users)}`
-✅ Active Users: `{len(active_users)}`
-🚫 Banned Users: `{len(users) - len(active_users)}`
-💎 Total Points: `{total_points}`
-👥 Total Referrals: `{total_referrals}`
-🎬 Total Videos: `{len(self.video_service.get_videos())}`
-            """
+👥 Users:
+  • Total: `{len(users)}`
+  • Active: `{len(active_users)}`
+  • Banned: `{len(users) - len(active_users)}`
+
+💎 Points:
+  • Total: `{total_points}`
+  • Referrals: `{total_referrals}`
+
+🎬 Content:
+  • Videos: `{len(videos)}`
+
+💰 Payments:
+  • Total Revenue: `₹{total_revenue}`
+  • Approved: `{len(approved_payments)}`
+  • Pending: `{len(pending_payments)}`
+"""
             
             self.bot.send_message(
                 message.chat.id,
@@ -162,7 +314,8 @@ class AdminHandlers:
         
         msg = self.bot.send_message(
             message.chat.id,
-            "📝 Enter user ID and points (format: user_id points):"
+            "📝 Enter user ID and points (format: `user_id points`)",
+            parse_mode='Markdown'
         )
         self.admin_states[message.from_user.id] = 'waiting_for_add_points'
     
@@ -173,7 +326,8 @@ class AdminHandlers:
         
         msg = self.bot.send_message(
             message.chat.id,
-            "📝 Enter user ID and points (format: user_id points):"
+            "📝 Enter user ID and points (format: `user_id points`)",
+            parse_mode='Markdown'
         )
         self.admin_states[message.from_user.id] = 'waiting_for_remove_points'
     
@@ -184,7 +338,8 @@ class AdminHandlers:
         
         msg = self.bot.send_message(
             message.chat.id,
-            "🔍 Enter user ID:"
+            "🔍 Enter user ID:",
+            parse_mode='Markdown'
         )
         self.admin_states[message.from_user.id] = 'waiting_for_user_id'
     
@@ -195,7 +350,8 @@ class AdminHandlers:
         
         msg = self.bot.send_message(
             message.chat.id,
-            "📢 Enter broadcast message:"
+            "📢 Enter broadcast message:",
+            parse_mode='Markdown'
         )
         self.admin_states[message.from_user.id] = 'waiting_for_broadcast'
     
@@ -206,7 +362,8 @@ class AdminHandlers:
         
         msg = self.bot.send_message(
             message.chat.id,
-            "🚫 Enter user ID to ban:"
+            "🚫 Enter user ID to ban:",
+            parse_mode='Markdown'
         )
         self.admin_states[message.from_user.id] = 'waiting_for_ban_user'
     
@@ -217,7 +374,8 @@ class AdminHandlers:
         
         msg = self.bot.send_message(
             message.chat.id,
-            "✅ Enter user ID to unban:"
+            "✅ Enter user ID to unban:",
+            parse_mode='Markdown'
         )
         self.admin_states[message.from_user.id] = 'waiting_for_unban_user'
     
@@ -231,7 +389,8 @@ class AdminHandlers:
             
             text = "🏆 **Top 10 Referrers**\n\n"
             for i, user in enumerate(top_users, 1):
-                text += f"{i}. {user.name or user.username or f'User {user.id}'} - {user.referrals} referrals\n"
+                name = user.name or user.username or f'User {user.id}'
+                text += f"{i}. {name} - {user.referrals} referrals\n"
             
             self.bot.send_message(
                 message.chat.id,
@@ -251,7 +410,7 @@ class AdminHandlers:
             users = self.user_service.get_all_users()
             filename = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             
-            with open(filename, 'w', newline='') as f:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     'User ID', 'Username', 'Name', 'Points', 'Free Videos',
@@ -282,7 +441,7 @@ class AdminHandlers:
             users = self.user_service.get_all_users()
             filename = f"referrals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             
-            with open(filename, 'w', newline='') as f:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 writer.writerow(['User ID', 'Username', 'Name', 'Referrals', 'Points Earned'])
                 
@@ -296,7 +455,7 @@ class AdminHandlers:
             with open(filename, 'rb') as f:
                 self.bot.send_document(
                     message.chat.id, f,
-                    caption=f"📁 Referral Export: {sum(1 for u in users if u.referrals > 0)} active referrers"
+                    caption=f"📁 Referral Export: {sum(1 for u in users if u.referrals > 0)} referrers"
                 )
             
             os.remove(filename)
@@ -315,3 +474,142 @@ class AdminHandlers:
         except Exception as e:
             bot_logger.error(f"Error in handle_backup: {e}")
             self.bot.send_message(message.chat.id, "❌ Backup failed.")
+    
+    def handle_payments(self, message: Message) -> None:
+        """Handle payment management"""
+        if not self.is_admin(message.from_user.id):
+            return
+        
+        try:
+            all_payments = self.payment_service.get_all_payments()
+            pending = [p for p in all_payments if p.status == PaymentStatus.PENDING.value]
+            
+            if not pending:
+                self.bot.send_message(message.chat.id, "✅ No pending payments.")
+                return
+            
+            text = "💳 **Pending Payments**\n\n"
+            for i, payment in enumerate(pending[:10], 1):
+                user = self.user_service.get_user(payment.user_id)
+                user_name = user.name if user else f"User {payment.user_id}"
+                text += f"{i}. {user_name}\n"
+                text += f"   Amount: ₹{payment.amount}\n"
+                text += f"   Method: {payment.method.upper()}\n"
+                text += f"   ID: {payment.payment_id}\n\n"
+            
+            self.bot.send_message(message.chat.id, text, parse_mode='Markdown')
+        
+        except Exception as e:
+            bot_logger.error(f"Error in handle_payments: {e}")
+            self.bot.send_message(message.chat.id, "❌ An error occurred.")
+    
+    def handle_force_join(self, message: Message) -> None:
+        """Handle force join management"""
+        if not self.is_admin(message.from_user.id):
+            return
+        
+        try:
+            from keyboards.admin_keyboards import get_force_join_menu
+            self.bot.send_message(
+                message.chat.id,
+                "🔗 **Force Join Channels**",
+                parse_mode='Markdown',
+                reply_markup=get_force_join_menu()
+            )
+        except Exception as e:
+            bot_logger.error(f"Error in handle_force_join: {e}")
+    
+    def handle_admin_text(self, message: Message) -> None:
+        """Handle admin text input for states"""
+        if not self.is_admin(message.from_user.id):
+            return
+        
+        state = self.admin_states.get(message.from_user.id)
+        
+        if state == 'waiting_for_delete_index':
+            try:
+                index = int(message.text)
+                if self.video_service.delete_video(index):
+                    self.bot.send_message(message.chat.id, "✅ Video deleted.")
+                else:
+                    self.bot.send_message(message.chat.id, "❌ Invalid video index.")
+                self.admin_states[message.from_user.id] = None
+            except ValueError:
+                self.bot.send_message(message.chat.id, "❌ Invalid input.")
+        
+        elif state == 'waiting_for_add_points':
+            try:
+                parts = message.text.split()
+                user_id = int(parts[0])
+                points = int(parts[1])
+                
+                if self.user_service.add_points(user_id, points):
+                    self.bot.send_message(message.chat.id, f"✅ Added {points} points to user {user_id}.")
+                else:
+                    self.bot.send_message(message.chat.id, "❌ User not found.")
+                self.admin_states[message.from_user.id] = None
+            except (ValueError, IndexError):
+                self.bot.send_message(message.chat.id, "❌ Invalid format. Use: user_id points")
+        
+        elif state == 'waiting_for_remove_points':
+            try:
+                parts = message.text.split()
+                user_id = int(parts[0])
+                points = int(parts[1])
+                
+                if self.user_service.remove_points(user_id, points):
+                    self.bot.send_message(message.chat.id, f"✅ Removed {points} points from user {user_id}.")
+                else:
+                    self.bot.send_message(message.chat.id, "❌ Failed to remove points.")
+                self.admin_states[message.from_user.id] = None
+            except (ValueError, IndexError):
+                self.bot.send_message(message.chat.id, "❌ Invalid format. Use: user_id points")
+        
+        elif state == 'waiting_for_user_id':
+            try:
+                user_id = int(message.text)
+                user = self.user_service.get_user(user_id)
+                
+                if user:
+                    text = f"""👤 **User Points**
+
+User ID: `{user.id}`
+Name: `{user.name}`
+Points: `{user.points}`
+Free Videos: `{user.free_videos_left}`
+Unlock Videos: `{user.videos_remaining}`
+Referrals: `{user.referrals}`
+"""
+                    self.bot.send_message(message.chat.id, text, parse_mode='Markdown')
+                else:
+                    self.bot.send_message(message.chat.id, "❌ User not found.")
+                self.admin_states[message.from_user.id] = None
+            except ValueError:
+                self.bot.send_message(message.chat.id, "❌ Invalid user ID.")
+        
+        elif state == 'waiting_for_broadcast':
+            # TODO: Implement broadcast
+            self.bot.send_message(message.chat.id, "📢 Broadcast feature coming soon.")
+            self.admin_states[message.from_user.id] = None
+        
+        elif state == 'waiting_for_ban_user':
+            try:
+                user_id = int(message.text)
+                if self.user_service.ban_user(user_id):
+                    self.bot.send_message(message.chat.id, f"✅ User {user_id} banned.")
+                else:
+                    self.bot.send_message(message.chat.id, "❌ User not found.")
+                self.admin_states[message.from_user.id] = None
+            except ValueError:
+                self.bot.send_message(message.chat.id, "❌ Invalid user ID.")
+        
+        elif state == 'waiting_for_unban_user':
+            try:
+                user_id = int(message.text)
+                if self.user_service.unban_user(user_id):
+                    self.bot.send_message(message.chat.id, f"✅ User {user_id} unbanned.")
+                else:
+                    self.bot.send_message(message.chat.id, "❌ User not found.")
+                self.admin_states[message.from_user.id] = None
+            except ValueError:
+                self.bot.send_message(message.chat.id, "❌ Invalid user ID.")
