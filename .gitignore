@@ -1,0 +1,24 @@
+# Environment
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Database backups
+data/backups/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+temp/
+*.tmp

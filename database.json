@@ -1,0 +1,12 @@
+{
+  "users": {},
+  "videos": [],
+  "admin_buttons": [],
+  "force_join_channels": [],
+  "force_join_enabled": true,
+  "metadata": {
+    "version": "1.0.0",
+    "last_backup": "",
+    "created_at": ""
+  }
+}
