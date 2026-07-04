@@ -1,7 +1,8 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env file from current directory
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 # Bot Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -31,3 +32,7 @@ for directory in [BACKUP_DIR, LOG_DIR, TEMP_DIR]:
 FREE_VIDEOS_PER_USER = 2
 VIDEOS_PER_POINT = 5
 REFERRAL_POINT_VALUE = 1
+
+# Validate BOT_TOKEN
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN is not set in .env file!")
