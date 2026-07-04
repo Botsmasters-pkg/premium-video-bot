@@ -1,5 +1,5 @@
 from telebot import TeleBot
-from telebot.types import Message, CallbackQuery
+from telebot.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from config import BOT_USERNAME
 from utils.database import Database
 from services.user_service import UserService
@@ -51,19 +51,18 @@ class UserHandlers:
                 except ValueError:
                     pass
             
-            welcome_text = f"""
-👋 Welcome to Premium Video Bot!
+            welcome_text = f"""👋 **Welcome to Premium Video Bot!**
 
 🎬 Watch unlimited premium videos
 💎 Earn points through referrals
 👥 Share your referral link and get rewards
 
-Let's get started!
-            """
+Let's get started!"""
             
             self.bot.send_message(
                 message.chat.id,
                 welcome_text,
+                parse_mode='Markdown',
                 reply_markup=get_main_menu(user.id)
             )
         except Exception as e:
@@ -71,40 +70,97 @@ Let's get started!
             self.bot.send_message(message.chat.id, "❌ An error occurred. Please try again.")
     
     def handle_watch_video(self, message: Message) -> None:
-        """Handle watch video button"""
+        """Handle watch video button with improved logic"""
         try:
             user = self.user_service.get_user(message.from_user.id)
             if not user:
                 self.bot.send_message(message.chat.id, "❌ User not found.")
                 return
             
-            # Check force join requirement
+            # LOGIC PRIORITY 1: Check if user can watch any video
+            # User can watch if they have free videos OR points for premium videos
+            has_free_videos = user.free_videos_left > 0
+            has_premium_points = user.videos_remaining > 0
+            
+            if not has_free_videos and not has_premium_points:
+                # User has no free videos and no points
+                referral_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
+                
+                insufficient_text = f"""❌ **You don't have enough points to watch a premium video.**
+
+💰 **Required:** 1 Point (for 5 videos)
+⭐ **Your Balance:** {user.points} Points
+
+🎁 Earn more points by inviting your friends using your referral link below:
+
+🔗 **Your Referral Link:**
+`{referral_link}`
+
+👥 Every successful referral earns you **1 point**.
+
+Once you have enough points, come back and watch premium videos!"""
+                
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🎁 Invite Friends", url=referral_link))
+                
+                self.bot.send_message(
+                    message.chat.id,
+                    insufficient_text,
+                    parse_mode='Markdown',
+                    reply_markup=markup
+                )
+                return
+            
+            # LOGIC PRIORITY 2: Check if videos exist
+            videos = self.video_service.get_videos()
+            if not videos:
+                self.bot.send_message(
+                    message.chat.id,
+                    "🎥 **No premium videos are available right now.**\n\nPlease check back later. New videos are uploaded regularly by the admin.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # LOGIC PRIORITY 3: Check force join requirement
             if self.db.is_force_join_enabled():
                 channels = self.db.get_force_join_channels()
                 if channels:
                     # TODO: Verify membership before sending video
                     pass
             
-            # Get next video
+            # LOGIC PRIORITY 4: Get next video and send it
             video = self.video_service.get_next_video(user)
             if not video:
+                # This shouldn't happen if videos exist, but handle it
                 self.bot.send_message(
                     message.chat.id,
-                    "🎥 No videos available at the moment. Please try again later or earn points through referrals."
+                    "🎥 **No premium videos are available right now.**\n\nPlease check back later. New videos are uploaded regularly by the admin.",
+                    parse_mode='Markdown'
                 )
                 return
             
             # Update user
             self.user_service.update_user(user)
             
-            # Send video
-            caption = f"{video.caption}\n\n📊 Videos Watched: {len(user.videos_watched)}"
+            # Build caption with video info
+            caption = f"{video.caption}\n\n"
+            caption += f"📊 **Videos Watched:** {len(user.videos_watched)}\n"
+            
+            if has_free_videos and user.free_videos_left > 0:
+                caption += f"🎁 **Free Videos Left:** {user.free_videos_left - 1}"
+            elif has_premium_points:
+                caption += f"💎 **Premium Videos Left:** {user.videos_remaining - 1}"
+            
             self.bot.send_video(
                 message.chat.id,
                 video.file_id,
                 caption=caption,
+                parse_mode='Markdown',
                 reply_markup=get_video_menu()
             )
+            
+            bot_logger.info(f"User {message.from_user.id} watched video {video.file_unique_id}")
+        
         except Exception as e:
             bot_logger.error(f"Error in handle_watch_video: {e}")
             self.bot.send_message(message.chat.id, "❌ An error occurred while fetching the video.")
@@ -117,8 +173,7 @@ Let's get started!
                 self.bot.send_message(message.chat.id, "❌ User not found.")
                 return
             
-            profile_text = f"""
-👤 **Your Profile**
+            profile_text = f"""👤 **Your Profile**
 
 👤 User ID: `{user.id}`
 💎 Current Points: `{user.points}`
@@ -126,8 +181,7 @@ Let's get started!
 🎬 Unlock Videos: `{user.videos_remaining}`
 👥 Total Referrals: `{user.referrals}`
 🎥 Videos Watched: `{len(user.videos_watched)}`
-📅 Join Date: `{user.join_date}`
-            """
+📅 Join Date: `{user.join_date}`"""
             
             self.bot.send_message(
                 message.chat.id,
@@ -148,8 +202,7 @@ Let's get started!
                 return
             
             referral_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
-            referral_text = f"""
-👥 **Your Referral**
+            referral_text = f"""👥 **Your Referral**
 
 🔗 Referral Link:
 `{referral_link}`
@@ -160,8 +213,7 @@ Let's get started!
 🎬 Videos Unlocked: `{user.referrals * 5}`
 
 🎁 Earn 1 Point for every successful referral!
-1 Point = 5 Videos
-            """
+1 Point = 5 Videos"""
             
             self.bot.send_message(
                 message.chat.id,
@@ -181,8 +233,7 @@ Let's get started!
                 self.bot.send_message(message.chat.id, "❌ User not found.")
                 return
             
-            points_text = f"""
-💎 **Your Points**
+            points_text = f"""💎 **Your Points**
 
 💎 Current Points: `{user.points}`
 🎬 Remaining Videos: `{user.videos_remaining}`
@@ -192,8 +243,7 @@ Let's get started!
 👥 1 Referral = 1 Point
 🎬 1 Point = 5 Videos
 
-🔗 Share your referral link to earn points!
-            """
+🔗 Share your referral link to earn points!"""
             
             self.bot.send_message(
                 message.chat.id,
